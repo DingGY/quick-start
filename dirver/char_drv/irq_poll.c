@@ -107,7 +107,6 @@ static int __init m_key_init(void){
     major = register_chrdev(DEV_MAJOR, DRIVER_NAME, &key_fops);
     pkey_class = class_create(THIS_MODULE, DRIVER_NAME);
     device_create(pkey_class, NULL, MKDEV(major, 0), NULL, DEV_NODE);
-    // sema_init (&sem, 0);
     return 0;
 }
 
