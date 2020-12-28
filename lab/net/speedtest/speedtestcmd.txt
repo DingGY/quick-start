@@ -1,0 +1,74 @@
+cd /var
+rmmod speedtest.ko
+tftp -g -r speedtest66.bin 192.168.2.100
+insmod speedtest66.bin
+
+
+cd /var
+tftp -g -r speedtest.sh 192.168.2.100
+chmod +x speedtest.sh
+./speedtest.sh
+
+
+
+echo 1 20 400 > /proc/net/speedtest
+
+echo ratelimit tx w Disable 64 > /proc/qdma_lan/ratelimit
+echo ratelimit rx w Disable 64 > /proc/qdma_lan/ratelimit
+echo ratemeter tx w Disable 64 > /proc/qdma_lan/ratelimit
+switchmgr stormctrl type 0
+
+
+switchmgr vlanactive 1
+sys memwl bfb58010 0000ffe0
+switchmgr vlan eg-tag-pcr 6 3
+
+p4,p2 vlan绑定
+switchmgr vlan pvid 1 10
+switchmgr vlan pvid 3 10
+switchmgr vlan vid 10 1 10 10 0 1 0 0 
+
+p1,cpu vlan绑定
+switchmgr vlan pvid 4 6
+switchmgr vlan pvid 6 6
+switchmgr vlan vid 6 1 6 80 0 1 0 0 
+1 2 x 3 6[cpu]
+
+1 | 2 | 3 | 4 | 5 | 6 | 7   |  8
+  |p4 |p3 |p2 |p1 |	  | cpu |
+       左--->右
+	   
+	   
+测试命令：
+
+
+echo ratelimit rx w Disable 64 > /proc/qdma_lan/ratelimit
+switchmgr stormctrl type 0
+
+sys memwl bfb58010 0000ffe0
+
+
+switchmgr vlan pvid 2 10
+switchmgr vlan pvid 3 10
+switchmgr vlan vid 10 1 10 12 0 1 0 0 
+
+switchmgr vlan pvid 6 6
+switchmgr vlan vid 6 1 6 82 0 1 0 0 
+
+switchmgr vlan pvid 4 4
+switchmgr vlan vid 4 1 4 80 0 1 0 0 
+
+switchmgr vlan pvid 1 1
+switchmgr vlan vid 1 1 1 66 0 1 0 0 
+
+echo 1 20 400 1700 0 > /proc/net/speedtest
+
+
+性能:
+	+校验
+	单口150M
+	
+	-校验
+	单口151M
+
+
