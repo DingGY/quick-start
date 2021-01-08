@@ -35,33 +35,42 @@
 #define SPEEDTEST_COMPTUE_CPU_BASE 1
 #define SPEEDTEST_CPU_BASE (SPEEDTEST_COMPTUE_CPU_BASE + 1)
 
-#define SPEEDTEST_SKBQUEUE_SIZE (1024 * 1024)
+#define SPEEDTEST_SKBQUEUE_SIZE (2 * 1024 * 1024)
 
 #define GET_RESIDUAL_BYTE(size, s) (size - (skb_tail_pointer(s) - skb_mac_header(s)))
 
 
+typedef enum running_state {
+	ST_IDLE,
+	ST_RUNNING,
+	ST_FINISHED,
+} running_state_t;
 
 
 struct speedtest_status {
-	unsigned long begin_time;
-	unsigned long pktrcv_count;
-	unsigned long pktsend_count;
-	unsigned long pkterr_count;
+
+	running_state_t state;
+	uint32_t begin_time;
+	uint32_t end_time;
+	uint64_t pktrcv_count;
+	uint64_t pktsend_count;
+	uint64_t pkterr_count;
+	uint64_t pktlose_count;
 	__sum16 pkt_csum;
 };
 
 struct speedtest_cfg {
-	int enable;
-	unsigned int dur_time;
-	unsigned int speed; //Mbit/s
-	unsigned int pkt_size;
-	char port;
+	uint32_t enable;
+	uint32_t dur_time;
+	uint32_t speed; //Mbit/s
+	uint32_t pkt_size;
+	uint8_t port;
 	struct speedtest_status status;
 	struct task_struct *task;
 	
 };
 
-static struct speedtest_cfg st_cfg[SPEEDTEST_TASK_NUM] = {0};
+static struct speedtest_cfg st_cfg[SPEEDTEST_TASK_NUM];
 static struct task_struct *compute_task = NULL;
 static struct kfifo comp_skbqueue;
 static struct timer_list loop_detect_timer;
@@ -104,12 +113,24 @@ static int is_speedtest_task_running(void)
 
 static int xmit_speedtest_pkt(struct sk_buff *skb)
 {
-	if(likely(is_speedtest_task_running()))
+
+
+	if(likely(st_ready == 0x03 || is_speedtest_task_running()))
 	{
-		dev_kfree_skb_any(skb);
-		return 0;
+		goto free_skb;
+	}
+	if(!st_loop_timer_enable && skb->dev)
+	{
+		if(!strcmp(skb->dev->name, "vif_lan1") || !strcmp(skb->dev->name, "br0") || !strcmp(skb->dev->name, "eth0.1"))
+		{
+			return 1;
+		}
+		goto free_skb;
 	}
 	return 1;
+free_skb:
+	dev_kfree_skb_any(skb);
+	return 0;
 }
  
 static int fast_rcv_speedtest_pkt(struct sk_buff *skb)
@@ -123,24 +144,22 @@ static int rcv_speedtest_probe_pkt(struct sk_buff *skb)
 {
 	struct ethhdr *ethd = (struct ethhdr *)(skb->data);
 	
-	if(unlikely(!is_speedtest_task_running() && st_loop_timer_enable))
+	if(unlikely(!is_speedtest_task_running()))
 	{
 		if(unlikely(!memcmp(ethd->h_source, st0_mac, 6)))
 		{
-		
 			ST_DBG("detect the speedtest loop probe 1...\n");
 			st_ready  |= 0x01;
 			goto free_probe_skb;
 		}
 		if(unlikely(!memcmp(ethd->h_source, st1_mac, 6)))
 		{
-		
 			ST_DBG("detect the speedtest loop probe 2...\n");
 			st_ready  |= 0x02;
 			goto free_probe_skb;
 
 		}
-		//forward other packet
+		//forward other packets
 		return 0;
 	}
 	
@@ -160,7 +179,6 @@ static int make_speedtest_pkt(struct sk_buff **st_skb, char port, int pkt_size)
 
 	struct sk_buff *skb = NULL;
 	struct net_device *dev = NULL;
-	int i = 0;
 	unsigned short hlen = 0;
 	unsigned short tlen = 0;
 	__wsum csum;
@@ -225,7 +243,7 @@ static int make_speedtest_pkt(struct sk_buff **st_skb, char port, int pkt_size)
 	udph->dest = htons(9999);
 	udph->len = htons(skb_tail_pointer(skb) - skb_transport_header(skb));
 	
-	memset((char *)udph+sizeof(struct udphdr), 0x11, ntohs(udph->len) - sizeof(struct udphdr));
+	memset((char *)udph+sizeof(struct udphdr), 0xaa, ntohs(udph->len) - sizeof(struct udphdr));
 	udph->check = 0;
 	csum = skb_checksum(skb, skb_transport_offset(skb), ntohs(udph->len), 0);
 	udph->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
@@ -308,7 +326,7 @@ static void speedtest_loopdetect_timer_init(void)
 {
 	init_timer(&loop_detect_timer);
 	loop_detect_timer.function = speedtest_loop_detect_cb;
-	loop_detect_timer.data = NULL;
+	loop_detect_timer.data = 0;
 	mod_timer(&loop_detect_timer, jiffies + HZ * SPEEDTEST_LOOPDETECT_TIMER_CIRCLE);
 
 }
@@ -320,28 +338,28 @@ static int speedtest_compute_func(void *data)
 	unsigned long end_time = 0;
 	struct sk_buff *skb = NULL;
 	struct ethhdr *ethd = NULL;
-	
+	struct speedtest_cfg *cfgs = (struct speedtest_cfg *)data;
 	ST_DBG("in compute thread func\n");
 	while(1)
 	{
 		while(kfifo_out(&comp_skbqueue, &skb, sizeof(void *)))
 		{
 			ethd = (struct ethhdr *)(skb->data);
-			if(ethd->h_source[0] == 0x10)
+			if(unlikely(!memcmp(ethd->h_source, st0_mac, 6)))
 			{
-				st_cfg[0].status.pktrcv_count++;
-				if(unlikely(st_cfg[0].status.pkt_csum != ip_compute_csum(skb->data + 18, skb->len - 18)))
+				cfgs[0].status.pktrcv_count++;
+				if(unlikely(cfgs[0].status.pkt_csum != ip_compute_csum(skb->data + 18, skb->len - 18)))
 				{
-					st_cfg[0].status.pkterr_count++;
+					cfgs[0].status.pkterr_count++;
 				}
 			}
-			else if(ethd->h_source[0] == 0x40)
+			else if(unlikely(!memcmp(ethd->h_source, st1_mac, 6)))
 			{
-				st_cfg[1].status.pktrcv_count++;
+				cfgs[1].status.pktrcv_count++;
 				
-				if(unlikely(st_cfg[1].status.pkt_csum != ip_compute_csum(skb->data + 18, skb->len - 18)))
+				if(unlikely(cfgs[1].status.pkt_csum != ip_compute_csum(skb->data + 18, skb->len - 18)))
 				{
-					st_cfg[1].status.pkterr_count++;
+					cfgs[1].status.pkterr_count++;
 				}
 			}
 			
@@ -351,7 +369,7 @@ static int speedtest_compute_func(void *data)
 		is_st_running = 0;
 		for(i = 0; i < SPEEDTEST_TASK_NUM; i++)
 		{
-			if(st_cfg[i].task)
+			if(cfgs[i].task)
 			{
 				is_st_running = 1;
 				end_time = 0;
@@ -375,12 +393,19 @@ static int speedtest_compute_func(void *data)
 		dev_kfree_skb_any(skb);
 	}
 	compute_task = NULL;
+	
+	hs_speedtest_rx_hook = rcv_speedtest_probe_pkt;
 	if(st_loop_timer_enable)
 	{
 		ST_DBG("enable loop detect timer.\n");
 		st_ready = 0;
 		speedtest_loopdetect_timer_init();
-		hs_speedtest_rx_hook = rcv_speedtest_probe_pkt;
+	}
+	
+	for(i = 0; i < SPEEDTEST_TASK_NUM; i++)
+	{
+		cfgs[i].status.pktlose_count = cfgs[i].status.pktsend_count - cfgs[i].status.pktrcv_count - cfgs[i].status.pkterr_count;
+		cfgs[i].status.state = ST_FINISHED;
 	}
 	ST_DBG("user quit compute thread.\n");
 	return 0;
@@ -409,6 +434,7 @@ static int speedtest_thread_func(void *data)
 		ST_DBG("make speedtest skb failed.\n");
 		return 0;
 	}
+	cfg->status.state = ST_RUNNING;
 	cfg->status.pkt_csum = ip_compute_csum(st_skb->data + 14, st_skb->len - 14);// skip ETH header
 	ST_DBG("pkt_csum: 0x%04x, st_skb->len: %d\n", cfg->status.pkt_csum, st_skb->len - 14);
 
@@ -421,9 +447,9 @@ static int speedtest_thread_func(void *data)
 	__getnstimeofday64(&current_time);
 	speed_time = send_time + current_time.tv_sec * 1000000000 + current_time.tv_nsec;
 	ST_DBG("calc end_time: %lu, send_time: %lu, speed_time: %lu\n", end_time, send_time, speed_time);
-	while(1)
+	if(cfg->speed < 100)
 	{
-		if(cfg->speed < 200)
+		while(1)
 		{
 			__getnstimeofday64(&current_time);
 			current_timens =  current_time.tv_sec * 1000000000 + current_time.tv_nsec;
@@ -432,24 +458,38 @@ static int speedtest_thread_func(void *data)
 				continue;
 			}
 			speed_time = send_time + current_timens;
-		}
-		if(likely(send_speedtest_pkt(st_skb)))
-		{
-			cfg->status.pktsend_count++;
-		}
 
-		
-		if(unlikely(kthread_should_stop() || (end_time < jiffies)))
-		{
-			break;
+			if(likely(send_speedtest_pkt(st_skb)))
+			{
+				cfg->status.pktsend_count++;
+			}
+
+			
+			if(unlikely(kthread_should_stop() || (end_time < jiffies)))
+			{
+				break;
+			}
 		}
-		
 	}
-	
+	else
+	{
+		while(1)
+		{
+			if(likely(send_speedtest_pkt(st_skb)))
+			{
+				cfg->status.pktsend_count++;
+			}
+			if(unlikely(kthread_should_stop() || (end_time < jiffies)))
+			{
+				break;
+			}
+		}
+	}
 	ST_DBG("user quit speedtest thread.\n");
 	kfree_skb(st_skb);
 	cfg->task = NULL;
 	cfg->enable = 0;
+	cfg->status.end_time = jiffies/HZ;
 	return 0;
 }
 
@@ -457,28 +497,47 @@ static int speedtest_thread_func(void *data)
 static int speedtest_proc_show(struct seq_file *m, void *v)
 {
 	int i = 0;
-
-	
+	uint32_t used_time = 0;
+	char state_str[16];
 	seq_printf(m, "SPEEDTEST STATUS: READY_%d\n", st_ready);
 	for(i = 0; i < SPEEDTEST_TASK_NUM; i++)
 	{
-	
-		seq_printf(m, "===================  DIRECTION %d  =================\n", i);
+		switch(st_cfg[i].status.state)
+		{
+			case ST_IDLE:
+				strcpy(state_str, "IDLE");
+				break;
+			case ST_RUNNING:
+				strcpy(state_str, "RUNNING");
+				break;
+			case ST_FINISHED:
+				strcpy(state_str, "FINISHED");
+				break;
+			default:
+				strcpy(state_str, "ERROR");
+				break;
+		}
+		used_time = st_cfg[i].status.end_time ? (st_cfg[i].status.end_time - st_cfg[i].status.begin_time) : (jiffies/HZ - st_cfg[i].status.begin_time);
+		seq_printf(m, "===================  DIRECTION %d  =================\n\n", i);
 		
-		seq_printf(m, "STATUS:\n");
+		seq_printf(m, "STATUS: %s\n\n", state_str);
 		
-		seq_printf(m, "       pktsend count:%lu,  pktrcv count:%lu, pkterr count:%lu, used time: %lu, pkt_csum: 0x%08x\n", 
+		seq_printf(m, "       pktsend count:%llu\n       pktrcv count:%llu\n       pkterr count:%llu\n       pktlose count:%llu\n       pkt_csum: 0x%04x\n       speed: %llu Mbit/s\n       used time: %lu\n", 
 			st_cfg[i].status.pktsend_count, 
 			st_cfg[i].status.pktrcv_count,  
-			st_cfg[i].status.pkterr_count, jiffies/HZ - st_cfg[i].status.begin_time, 
-			st_cfg[i].status.pkt_csum);
-		
-		seq_printf(m, "CONFIG:\n");
-		
-		seq_printf(m, "       enable:%d,  dur_time:%u, speed: %u, port: %u\n", 
-			st_cfg[i].enable, st_cfg[i].dur_time, st_cfg[i].speed, st_cfg[i].port);
+			st_cfg[i].status.pkterr_count,
+			st_cfg[i].status.pktlose_count,
+			st_cfg[i].status.pkt_csum,
+			(st_cfg[i].status.pktsend_count * (uint64_t)st_cfg[i].pkt_size * 8) / ((uint64_t)used_time * 1024 * 1024),
+			used_time);	
 	}
-
+	seq_printf(m, "\n\n");
+	for(i = 0; i < SPEEDTEST_TASK_NUM; i++)
+	{
+		seq_printf(m, "CONFIG %d:\n", i);
+		seq_printf(m, " 	  enable:%d,  dur_time:%u, speed: %u, port: %u, pkt_size: %u\n", 
+			st_cfg[i].enable, st_cfg[i].dur_time, st_cfg[i].speed, st_cfg[i].port, st_cfg[i].pkt_size);
+	}
 	return 0;
 }
 static void stop_compspeedtest_task(void)
@@ -576,7 +635,7 @@ static int run_speedtest_by_cmd(char *cmd)
 		hs_speedtest_rx_hook = fast_rcv_speedtest_pkt;
 		st_ready = 0;
 		stop_compspeedtest_task();
-		compute_task = kthread_create(speedtest_compute_func, NULL, "speedtest-comp");
+		compute_task = kthread_create(speedtest_compute_func, st_cfg, "speedtest-comp");
 		if(IS_ERR(compute_task)){
 			ST_ERR("Unable to start kernel compute thread.\n");
 			stop_allspeedtest_task();
@@ -626,8 +685,6 @@ static const struct file_operations speedtest_proc_fops = {
 
 static int __init speedtest_init_module(void)
 {
-	int st_err;
-
 	if (!proc_create("speedtest", S_IRUGO, init_net.proc_net, &speedtest_proc_fops))
 		return -ENOMEM;
 	

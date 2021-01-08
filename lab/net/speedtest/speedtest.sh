@@ -1,9 +1,10 @@
 #!/bin/sh
-insmod /lib/modules/speedtest.bin
+insmod /lib/modules/speedtest.ko
 while true
 do
 	DATA=`cat /proc/net/speedtest | grep "READY_3"`
 	if [ "$DATA" != "" ];then
+		sleep 5
 		echo ratelimit rx w Disable 64 > /proc/qdma_lan/ratelimit
 		switchmgr stormctrl type 0
 		sys memwl bfb58010 0000ffe0
